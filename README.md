@@ -1,6 +1,5 @@
-* Xournal
-
-** (Yet another "own version" of Xournal)
+# Xournal
+_(Yet another "own version" of Xournal)_
 
 I'm using Xournal extensively for writing notes/sketches for my research and
 drawing graphics for presentations. In order to get rid of some nuisances I've
