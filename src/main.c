@@ -35,7 +35,7 @@ static gchar **file_arguments = NULL;
 static GOptionEntry entries[] =
 {
   { "page", 'p', 0, G_OPTION_ARG_INT, &open_page_nr, "Jump to Page", "N" },
-  { "set-role", 'r', 0, G_OPTION_ARG_STRING, &custom_role, "Set WM_WINDOW_ROLE", "CUSTOM_ROLE" },
+  { "role", 'r', 0, G_OPTION_ARG_STRING, &custom_role, "Set WM_WINDOW_ROLE", "CUSTOM_ROLE" },
   { "export-pdf", 'A', 0, G_OPTION_ARG_STRING, &export_pdf_file, "Export document to a PDF file", "FILENAME" },
   { G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_FILENAME_ARRAY, &file_arguments, NULL, N_("[FILE]") },
   { NULL }
@@ -108,6 +108,10 @@ void init_stuff (int argc, char *argv[])
   bgpdf.status = STATUS_NOT_INIT;
 
   new_journal();
+  
+  if(custom_role) {
+    gtk_window_set_role(GTK_WINDOW(winMain), custom_role);
+  }
 
   if(export_pdf_file) {
     show_gui = FALSE;
@@ -393,7 +397,6 @@ main (int argc, char *argv[])
   
   init_stuff (argc, argv);
   gtk_window_set_icon(GTK_WINDOW(winMain), create_pixbuf("xournal.png"));
-  gtk_window_set_role(GTK_WINDOW(winMain), custom_role);
   gtk_main ();
   
   if (bgpdf.status != STATUS_NOT_INIT) shutdown_bgpdf();
