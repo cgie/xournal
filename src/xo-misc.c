@@ -22,6 +22,7 @@
 #include <gtk/gtk.h>
 #include <libgnomecanvas/libgnomecanvas.h>
 #include <gdk/gdkkeysyms.h>
+#include <time.h>
 
 #include "xournal.h"
 #include "xo-interface.h"
@@ -32,6 +33,7 @@
 #include "xo-paint.h"
 #include "xo-shapes.h"
 #include "xo-image.h"
+#include "xo-selection.h"
 
 // some global constants
 
@@ -51,6 +53,40 @@ double predef_thickness[NUM_STROKE_TOOLS][THICKNESS_MAX] =
     { 2.83, 2.83, 8.50, 19.84, 19.84 }, // highlighter thicknesses = 1, 3, 7 mm
   };
 
+// my own basename() replacement; allows windows filenames even on linux
+
+gchar *xo_basename(gchar *s, gboolean xplatform)
+{
+  gchar *p;
+
+  p = strrchr(s, G_DIR_SEPARATOR);
+  if (p == NULL && G_DIR_SEPARATOR != '/') p = strrchr(s, '/');
+  if (xplatform && p == NULL && G_DIR_SEPARATOR != '\\') p = strrchr(s, '\\');
+  if (p != NULL) return p+1; // dir separator found
+  if (xplatform || G_DIR_SEPARATOR == '\\') { // windows drive letters
+    if (g_ascii_isalpha(s[0]) && s[1]==':') return s+2;
+  }
+  return s; // whole string
+}
+
+// candidate xoj filename for save, save-as, autosave, etc.
+
+gchar *candidate_save_filename(void)
+{
+  time_t curtime;
+  char stime[30];
+  
+  if (ui.filename != NULL) return g_strdup(ui.filename);
+  if (bgpdf.status!=STATUS_NOT_INIT && bgpdf.file_domain == DOMAIN_ABSOLUTE 
+        && bgpdf.filename != NULL)
+    return g_strdup_printf("%s.xoj", bgpdf.filename->s);
+  curtime = time(NULL);
+  strftime(stime, 30, "%Y-%m-%d-Note-%H-%M.xoj", localtime(&curtime));
+  if (ui.default_path!=NULL) 
+    return g_strdup_printf("%s%c%s", ui.default_path, G_DIR_SEPARATOR, stime);
+  else return g_strdup(stime);
+}
+
 // some manipulation functions
 
 struct Page *new_page(struct Page *template)
@@ -62,7 +98,10 @@ struct Page *new_page(struct Page *template)
   l->nitems = 0;
   pg->layers = g_list_append(NULL, l);
   pg->nlayers = 1;
-  pg->bg = (struct Background *)g_memdup(template->bg, sizeof(struct Background));
+  if (template->bg->type != BG_SOLID && !ui.new_page_bg_from_pdf)
+    pg->bg = (struct Background *)g_memdup(ui.default_page.bg, sizeof(struct Background));
+  else 
+    pg->bg = (struct Background *)g_memdup(template->bg, sizeof(struct Background));
   pg->bg->canvas_item = NULL;
   if (pg->bg->type == BG_PIXMAP || pg->bg->type == BG_PDF) {
     g_object_ref(pg->bg->pixbuf);
@@ -173,6 +212,7 @@ void prepare_new_undo(void)
   u->multiop = 0;
   undo = u;
   ui.saved = FALSE;
+  ui.need_autosave = TRUE;
   clear_redo_stack();
 }
 
@@ -364,8 +404,10 @@ void delete_layer(struct Layer *l)
   
   while (l->items!=NULL) {
     item = (struct Item *)l->items->data;
-    if (item->type == ITEM_STROKE && item->path != NULL) 
+    if (item->type == ITEM_STROKE && item->path != NULL) {
       gnome_canvas_points_free(item->path);
+      if (item->brush.variable_width) g_free(item->widths);
+    }
     if (item->type == ITEM_TEXT) {
       g_free(item->font_name); g_free(item->text);
     }
@@ -521,7 +563,28 @@ double get_pressure_multiplier(GdkEvent *event)
   rawpressure = axes[2]/(device->axes[2].max - device->axes[2].min);
   if (!finite_sized(rawpressure)) return 1.0;
 
+  if (rawpressure <= 0.) rawpressure = 0.;
+  if (rawpressure >= 1.0) rawpressure = 1.0;
   return ((1-rawpressure)*ui.width_minimum_multiplier + rawpressure*ui.width_maximum_multiplier);
+}
+
+
+void emergency_enable_xinput(GdkInputMode mode)
+{
+  GList *dev_list;
+  GdkDevice *dev;
+
+#ifdef INPUT_DEBUG
+  printf("DEBUG: Emergency xinput enable/disable: %d\n", mode);
+#endif
+  gdk_flush();
+  gdk_error_trap_push();
+  for (dev_list = gdk_devices_list(); dev_list != NULL; dev_list = dev_list->next) {
+    dev = GDK_DEVICE(dev_list->data);
+    gdk_device_set_mode(dev, mode);
+  }
+  gdk_flush();
+  gdk_error_trap_pop();
 }
 
 void update_item_bbox(struct Item *item)
@@ -566,6 +629,7 @@ void make_canvas_item_one(GnomeCanvasGroup *group, struct Item *item)
 {
   PangoFontDescription *font_desc;
   GnomeCanvasPoints points;
+  GtkWidget *dialog;
   int j;
 
   if (item->type == ITEM_STROKE) {
@@ -591,6 +655,15 @@ void make_canvas_item_one(GnomeCanvasGroup *group, struct Item *item)
     }
   }
   if (item->type == ITEM_TEXT) {
+#ifdef WIN32  // fontconfig cache generation takes forever, show hourglass
+    if (!ui.warned_generate_fontconfig) {
+      dialog = gtk_message_dialog_new(GTK_WINDOW(winMain), GTK_DIALOG_DESTROY_WITH_PARENT,
+         GTK_MESSAGE_OTHER, GTK_BUTTONS_NONE, _("Generating fontconfig library cache, please be patient..."));
+      gtk_window_set_title(GTK_WINDOW(dialog), _("Generating fontconfig cache..."));
+      gtk_widget_show_all(dialog);
+      set_cursor_busy(TRUE);
+    }
+#endif
     font_desc = pango_font_description_from_string(item->font_name);
     pango_font_description_set_absolute_size(font_desc, 
             item->font_size*ui.zoom*PANGO_SCALE);
@@ -600,6 +673,13 @@ void make_canvas_item_one(GnomeCanvasGroup *group, struct Item *item)
           "font-desc", font_desc, "fill-color-rgba", item->brush.color_rgba,
           "text", item->text, NULL);
     update_item_bbox(item);
+#ifdef WIN32 // done
+    if (!ui.warned_generate_fontconfig)  {
+      ui.warned_generate_fontconfig = TRUE;
+      gtk_widget_destroy(dialog);
+      set_cursor_busy(FALSE);
+    }
+#endif
   }
   if (item->type == ITEM_IMAGE) {
     item->canvas_item = gnome_canvas_item_new(group,
@@ -1234,8 +1314,15 @@ void update_mappings_menu(void)
 {
   gtk_widget_set_sensitive(GET_COMPONENT("optionsButtonMappings"), ui.use_xinput);
   gtk_widget_set_sensitive(GET_COMPONENT("optionsPressureSensitive"), ui.use_xinput);
+  gtk_widget_set_sensitive(GET_COMPONENT("optionsTouchAsHandTool"), ui.use_xinput);
+  gtk_widget_set_sensitive(GET_COMPONENT("optionsPenDisablesTouch"), ui.use_xinput);
+  gtk_widget_set_sensitive(GET_COMPONENT("optionsDesignateTouchscreen"), ui.use_xinput);
   gtk_check_menu_item_set_active(
     GTK_CHECK_MENU_ITEM(GET_COMPONENT("optionsButtonMappings")), ui.use_erasertip);
+  gtk_check_menu_item_set_active(
+    GTK_CHECK_MENU_ITEM(GET_COMPONENT("optionsTouchAsHandTool")), ui.touch_as_handtool);
+  gtk_check_menu_item_set_active(
+    GTK_CHECK_MENU_ITEM(GET_COMPONENT("optionsPenDisablesTouch")), ui.pen_disables_touch);
   gtk_check_menu_item_set_active(
     GTK_CHECK_MENU_ITEM(GET_COMPONENT("optionsPressureSensitive")), ui.pressure_sensitivity);
 
@@ -1551,14 +1638,12 @@ void update_file_name(char *filename)
     gtk_window_set_title(GTK_WINDOW (winMain), _("Xournal"));
     return;
   }
-  p = g_utf8_strrchr(filename, -1, '/');
-  if (p == NULL) p = filename; 
-  else p = g_utf8_next_char(p);
+  p = xo_basename(filename, FALSE);
   g_snprintf(tmp, 100, _("Xournal - %s"), p);
   gtk_window_set_title(GTK_WINDOW (winMain), tmp);
   new_mru_entry(filename);
 
-  if (filename[0]=='/') {
+  if (p!=filename) {
     if (ui.default_path!=NULL) g_free(ui.default_path);
     ui.default_path = g_path_get_dirname(filename);
   }
@@ -1816,7 +1901,7 @@ gboolean ok_to_close(void)
   gtk_dialog_add_button(GTK_DIALOG (dialog), GTK_STOCK_SAVE, GTK_RESPONSE_YES);
   gtk_dialog_add_button(GTK_DIALOG (dialog), GTK_STOCK_CANCEL, GTK_RESPONSE_CANCEL);
   gtk_dialog_set_default_response(GTK_DIALOG (dialog), GTK_RESPONSE_YES);
-  response = gtk_dialog_run(GTK_DIALOG (dialog));
+  response = wrapper_gtk_dialog_run(GTK_DIALOG (dialog));
   gtk_widget_destroy(dialog);
   if (response == GTK_RESPONSE_CANCEL || response == GTK_RESPONSE_DELETE_EVENT) 
     return FALSE; // aborted
@@ -2178,6 +2263,13 @@ void add_scroll_bindings(void)
   gtk_binding_entry_add_signal(binding_set, GDK_KP_Right, 0,
     "scroll_child", 2, GTK_TYPE_SCROLL_TYPE, GTK_SCROLL_STEP_FORWARD, 
     G_TYPE_BOOLEAN, TRUE);  
+  // make space and shift-space scroll down/up by a page
+  gtk_binding_entry_add_signal(binding_set, GDK_space, 0,
+    "scroll_child", 2, GTK_TYPE_SCROLL_TYPE, GTK_SCROLL_PAGE_DOWN, 
+    G_TYPE_BOOLEAN, TRUE);  
+  gtk_binding_entry_add_signal(binding_set, GDK_space, GDK_SHIFT_MASK,
+    "scroll_child", 2, GTK_TYPE_SCROLL_TYPE, GTK_SCROLL_PAGE_UP, 
+    G_TYPE_BOOLEAN, TRUE);  
 }
 
 gboolean is_event_within_textview(GdkEventButton *event)
@@ -2208,7 +2300,7 @@ void hide_unimplemented(void)
   }  
   
   /* screenshot feature doesn't work yet in Win32 */
-#ifdef WIN32
+#ifndef GDK_WINDOWING_X11
   gtk_widget_hide(GET_COMPONENT("journalScreenshot"));
 #endif
 }  
@@ -2450,4 +2542,16 @@ wrapper_poppler_page_render_to_pixbuf (PopplerPage *page,
 
   wrapper_copy_cairo_surface_to_pixbuf (surface, pixbuf);
   cairo_surface_destroy (surface);
+}
+
+// wrapper for gtk_dialog_run that disables xinput (bug #159)
+
+gint wrapper_gtk_dialog_run(GtkDialog *dialog)
+{
+  gint response;
+
+  if (!gtk_check_version(2, 17, 0))
+    emergency_enable_xinput(GDK_MODE_DISABLED);
+  response = gtk_dialog_run(dialog);
+  return response;            
 }

@@ -196,7 +196,7 @@ void update_cursor_for_resize(double *pt)
 
 #define SUBDIVIDE_MAXDIST 5.0
 
-void subdivide_cur_path(null)
+void subdivide_cur_path(void)
 {
   int n, pieces, k;
   double *p;
@@ -248,7 +248,7 @@ void create_new_stroke(GdkEvent *event)
 void continue_stroke(GdkEvent *event)
 {
   GnomeCanvasPoints seg;
-  double *pt, current_width;
+  double *pt, current_width, pressure;
 
   if (ui.cur_brush->ruler) {
     pt = ui.cur_path.coords;
@@ -261,7 +261,13 @@ void continue_stroke(GdkEvent *event)
   
   if (ui.cur_item->brush.variable_width) {
     realloc_cur_widths(ui.cur_path.num_points);
-    current_width = ui.cur_item->brush.thickness*get_pressure_multiplier(event);
+    pressure = get_pressure_multiplier(event);
+    if (pressure > ui.width_minimum_multiplier) 
+      current_width = ui.cur_item->brush.thickness*get_pressure_multiplier(event);
+    else { // reported pressure is 0.
+      if (ui.cur_path.num_points >= 2) current_width = ui.cur_widths[ui.cur_path.num_points-2];
+      else current_width = ui.cur_item->brush.thickness;
+    }
     ui.cur_widths[ui.cur_path.num_points-1] = current_width;
   }
   else current_width = ui.cur_item->brush.thickness;
@@ -290,6 +296,16 @@ void continue_stroke(GdkEvent *event)
        "cap-style", GDK_CAP_ROUND, "join-style", GDK_JOIN_ROUND,
        "fill-color-rgba", ui.cur_item->brush.color_rgba,
        "width-units", current_width, NULL);
+}
+
+void abort_stroke(void)
+{
+  if (ui.cur_item_type != ITEM_STROKE || ui.cur_item == NULL) return;
+  ui.cur_path.num_points = 0;
+  gtk_object_destroy(GTK_OBJECT(ui.cur_item->canvas_item));
+  g_free(ui.cur_item);
+  ui.cur_item = NULL;
+  ui.cur_item_type = ITEM_NONE;
 }
 
 void finalize_stroke(void)

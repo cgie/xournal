@@ -20,6 +20,7 @@
 #define PANGO_ENABLE_BACKEND /* to access PangoFcFont.font_pattern */
 
 #include <gtk/gtk.h>
+#include <glib/gstdio.h>
 #include <libgnomecanvas/libgnomecanvas.h>
 #include <zlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include <cairo/cairo-pdf.h>
 
 #define NO_MAPPERS
 #define NO_TYPE3
@@ -1122,7 +1124,7 @@ struct PdfImage *new_pdfimage(struct XrefTable *xref, GList **images, GdkPixbuf 
 // draw a page's graphics
 
 void pdf_draw_page(struct Page *pg, GString *str, gboolean *use_hiliter, 
-                   struct XrefTable *xref, GList **pdffonts, GList **pdfimages)
+                   struct XrefTable *xref, GList **pdffonts, GList **pdfimages, GList *end_layer)
 {
   GList *layerlist, *itemlist, *tmplist;
   struct Layer *l;
@@ -1161,7 +1163,7 @@ void pdf_draw_page(struct Page *pg, GString *str, gboolean *use_hiliter,
     cur_image->used_in_this_page = FALSE;
   }
 
-  for (layerlist = pg->layers; layerlist!=NULL; layerlist = layerlist->next) {
+  for (layerlist = pg->layers; layerlist!=end_layer; layerlist = layerlist->next) {
     l = (struct Layer *)layerlist->data;
     for (itemlist = l->items; itemlist!=NULL; itemlist = itemlist->next) {
       item = (struct Item *)itemlist->data;
@@ -1317,8 +1319,9 @@ gboolean print_to_pdf(char *filename)
   struct PdfFont *font;
   struct PdfImage *image;
   char *tmpbuf;
+  GList *last_layer;
   
-  f = fopen(filename, "wb");
+  f = g_fopen(filename, "wb");
   if (f == NULL) return FALSE;
   setlocale(LC_NUMERIC, "C");
   annot = FALSE;
@@ -1326,9 +1329,12 @@ gboolean print_to_pdf(char *filename)
   uses_pdf = FALSE;
   pdffonts = NULL;
   pdfimages = NULL;
+  n_page = 0;
   for (pglist = journal.pages; pglist!=NULL; pglist = pglist->next) {
     pg = (struct Page *)pglist->data;
     if (pg->bg->type == BG_PDF) uses_pdf = TRUE;
+    if (ui.exportpdf_layers) n_page += pg->nlayers; 
+    else n_page++;
   }
   
   if (uses_pdf && bgpdf.status != STATUS_NOT_INIT && 
@@ -1341,6 +1347,12 @@ gboolean print_to_pdf(char *filename)
       g_string_free(pdfbuf, TRUE);
       if (xref.data != NULL) g_free(xref.data);
     }
+  }
+
+  if (uses_pdf && !annot) { // couldn't parse the PDF: fall back to cairo?
+    fclose(f);
+    setlocale(LC_NUMERIC, "");
+    return FALSE;
   }
 
   if (!annot) {
@@ -1359,19 +1371,21 @@ gboolean print_to_pdf(char *filename)
   make_xref(&xref, n_obj_catalog+1, pdfbuf->len);
   g_string_append_printf(pdfbuf,
     "%d 0 obj\n<< /Type /Pages /Kids [", n_obj_catalog+1);
-  for (i=0;i<journal.npages;i++)
+  for (i=0;i<n_page;i++)
     g_string_append_printf(pdfbuf, "%d 0 R ", n_obj_pages_offs+i);
-  g_string_append_printf(pdfbuf, "] /Count %d >> endobj\n", journal.npages);
+  g_string_append_printf(pdfbuf, "] /Count %d >> endobj\n", n_page);
   make_xref(&xref, n_obj_catalog+2, pdfbuf->len);
   g_string_append_printf(pdfbuf, 
     "%d 0 obj\n<< /Type /ExtGState /CA %.2f >> endobj\n",
      n_obj_catalog+2, ui.hiliter_opacity);
-  xref.last = n_obj_pages_offs + journal.npages-1;
+  xref.last = n_obj_pages_offs + n_page-1;
   
   for (pglist = journal.pages, n_page = 0; pglist!=NULL;
-       pglist = pglist->next, n_page++) {
+       pglist = pglist->next) {
     pg = (struct Page *)pglist->data;
-    
+    if (ui.exportpdf_layers) last_layer = pg->layers; else last_layer = NULL;
+  do {
+    if (last_layer!=NULL) last_layer = last_layer->next;
     // draw the background and page into pgstrm
     pgstrm = g_string_new("");
     g_string_printf(pgstrm, "q 1 0 0 -1 0 %.2f cm 1 J 1 j ", pg->height);
@@ -1395,7 +1409,7 @@ gboolean print_to_pdf(char *filename)
       n_obj_bgpix = pdf_draw_bitmap_background(pg, pgstrm, &xref, pdfbuf);
     // draw the page contents
     use_hiliter = FALSE;
-    pdf_draw_page(pg, pgstrm, &use_hiliter, &xref, &pdffonts, &pdfimages);
+    pdf_draw_page(pg, pgstrm, &use_hiliter, &xref, &pdffonts, &pdfimages, last_layer);
     g_string_append_printf(pgstrm, "Q\n");
     
     // deflate pgstrm and write it
@@ -1483,6 +1497,9 @@ gboolean print_to_pdf(char *filename)
     show_pdfobj(obj, pdfbuf);
     free_pdfobj(obj);
     g_string_append(pdfbuf, " >> endobj\n");
+    n_page++;
+  }
+  while (last_layer!=NULL);
   }
   
   // after the pages, we insert fonts and images
@@ -1550,11 +1567,9 @@ gboolean print_to_pdf(char *filename)
   return TRUE;
 }
 
-/*********** Printing via gtk-print **********/
+/*********** Printing via cairo and gtk-print **********/
 
-#if GTK_CHECK_VERSION(2, 10, 0)
-
-// does the same job as update_canvas_bg(), but to a print context
+// does the same job as update_canvas_bg(), but to a cairo context
 
 void print_background(cairo_t *cr, struct Page *pg)
 {
@@ -1602,7 +1617,11 @@ void print_background(cairo_t *cr, struct Page *pg)
     poppler_page_get_size(pdfpage, &pgwidth, &pgheight);
     cairo_save(cr);
     cairo_scale(cr, pg->width/pgwidth, pg->height/pgheight);
+#if POPPLER_CHECK_VERSION (0, 8, 0)
+    poppler_page_render_for_printing(pdfpage, cr);
+#else
     poppler_page_render(pdfpage, cr);
+#endif
     cairo_restore(cr);
     g_object_unref(pdfpage);
   }
@@ -1618,11 +1637,9 @@ void print_background(cairo_t *cr, struct Page *pg)
   }
 }
 
-void print_job_render_page(GtkPrintOperation *print, GtkPrintContext *context, gint pageno, gpointer user_data)
+void print_page_to_cairo(cairo_t *cr, struct Page *pg, gdouble width, gdouble height, PangoLayout *layout, GList *end_layer)
 {
-  cairo_t *cr;
-  gdouble width, height, scale;
-  struct Page *pg;
+  gdouble scale;
   guint old_rgba;
   double old_thickness;
   GList *layerlist, *itemlist;
@@ -1631,14 +1648,8 @@ void print_job_render_page(GtkPrintOperation *print, GtkPrintContext *context, g
   int i;
   double *pt;
   PangoFontDescription *font_desc;
-  PangoLayout *layout;
-        
-  pg = (struct Page *)g_list_nth_data(journal.pages, pageno);
-  cr = gtk_print_context_get_cairo_context(context);
-  width = gtk_print_context_get_width(context);
-  height = gtk_print_context_get_height(context);
+
   scale = MIN(width/pg->width, height/pg->height);
-  
   cairo_translate(cr, (width-scale*pg->width)/2, (height-scale*pg->height)/2);
   cairo_scale(cr, scale, scale);
   cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
@@ -1650,7 +1661,7 @@ void print_job_render_page(GtkPrintOperation *print, GtkPrintContext *context, g
   cairo_set_source_rgb(cr, 0, 0, 0);
   old_thickness = 0.0;
 
-  for (layerlist = pg->layers; layerlist!=NULL; layerlist = layerlist->next) {
+  for (layerlist = pg->layers; layerlist!=end_layer; layerlist = layerlist->next) {
     l = (struct Layer *)layerlist->data;
     for (itemlist = l->items; itemlist!=NULL; itemlist = itemlist->next) {
       item = (struct Item *)itemlist->data;
@@ -1681,7 +1692,6 @@ void print_job_render_page(GtkPrintOperation *print, GtkPrintContext *context, g
         }
       }
       if (item->type == ITEM_TEXT) {
-        layout = gtk_print_context_create_pango_layout(context);
         font_desc = pango_font_description_from_string(item->font_name);
         if (item->font_size)
           pango_font_description_set_absolute_size(font_desc,
@@ -1691,7 +1701,6 @@ void print_job_render_page(GtkPrintOperation *print, GtkPrintContext *context, g
         pango_layout_set_text(layout, item->text, -1);
         cairo_move_to(cr, item->bbox.left, item->bbox.top);
         pango_cairo_show_layout(cr, layout);
-        g_object_unref(layout);
       }
       if (item->type == ITEM_IMAGE) {
         double scalex = (item->bbox.right-item->bbox.left)/gdk_pixbuf_get_width(item->image);
@@ -1707,4 +1716,54 @@ void print_job_render_page(GtkPrintOperation *print, GtkPrintContext *context, g
   }
 }
 
+#if GTK_CHECK_VERSION(2, 10, 0)
+
+void print_job_render_page(GtkPrintOperation *print, GtkPrintContext *context, gint pageno, gpointer user_data)
+{
+  cairo_t *cr;
+  gdouble width, height;
+  struct Page *pg;
+  PangoLayout *layout;
+        
+  pg = (struct Page *)g_list_nth_data(journal.pages, pageno);
+  cr = gtk_print_context_get_cairo_context(context);
+  width = gtk_print_context_get_width(context);
+  height = gtk_print_context_get_height(context);
+  layout = gtk_print_context_create_pango_layout(context);
+  print_page_to_cairo(cr, pg, width, height, layout, NULL);
+  g_object_unref(layout);
+}
+
 #endif
+
+gboolean print_to_pdf_cairo(char *filename)
+{
+  cairo_t *cr;
+  cairo_surface_t *surface;
+  struct Page *pg;
+  GList *list;
+  PangoLayout *layout;
+  cairo_status_t retval;
+  GList *last_layer;
+ 
+  surface = cairo_pdf_surface_create(filename, ui.default_page.width, ui.default_page.height);
+  for (list = journal.pages; list!=NULL; list = list->next) {
+    pg = (struct Page *)list->data;
+    if (ui.exportpdf_layers) last_layer = pg->layers; else last_layer = NULL;
+    do {
+      if (last_layer!=NULL) last_layer = last_layer->next;
+      cairo_pdf_surface_set_size(surface, pg->width, pg->height);
+      cr = cairo_create(surface);
+      layout = pango_cairo_create_layout(cr);
+      print_page_to_cairo(cr, pg, pg->width, pg->height, layout, last_layer);
+      g_object_unref(layout);
+      cairo_destroy(cr);
+      cairo_surface_show_page(surface);
+    }
+    while (last_layer!=NULL);
+  }
+  cairo_surface_finish(surface);
+  retval = cairo_surface_status(surface);
+  cairo_surface_destroy(surface);
+  return (retval == CAIRO_STATUS_SUCCESS);
+}
